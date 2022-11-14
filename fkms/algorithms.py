@@ -149,7 +149,7 @@ def kmeans_pp(A, k, weighted=True, sparse=False, verbose=False):
     return np.array(inits)
 
 
-def awasthisheffet(A, k, useSKLearn=True, sparse=False):
+def awasthisheffet(A, k, useSKLearn=True, sparse=False, round_values=True):
     '''
     The implementation here uses kmeans++ (i.e. probabilistic) to get initial centers 
     (\nu in the paper) instead of using a 10-approx algorithm.
@@ -207,14 +207,25 @@ def awasthisheffet(A, k, useSKLearn=True, sparse=False):
         # Works with sparse matrices as well.
         kmeans = KMeans(n_clusters=k, init=lloyd_init)
         kmeans.fit(A)
-        ret = (kmeans.cluster_centers_, kmeans)
+
+        # compute number of samples in each cluster
+        _, counts = np.unique(kmeans.labels_, return_counts=True)
+
+        # rounding
+        if round_values:
+            for i in range(kmeans.n_clusters):  # range(k)
+                for j in range(A.shape[1]):  # range(d)
+                    closest_idx = np.argmin(np.abs(A[:, j] - kmeans.cluster_centers_[i, j]))
+                    kmeans.cluster_centers_[i, j] = A[closest_idx, j]
+
+        ret = (kmeans.cluster_centers_, kmeans, counts)
     else:
         raise NotImplementedError()
     # We use the GPU version from torch:with
     return ret
 
 
-def kfed(x_dev, dev_k, k, useSKLearn=True, sparse=False):
+def kfed(x_dev, dev_k, k, useSKLearn=True, sparse=False, round_values=True):
     '''
     The full decentralized algorithm.
 
@@ -268,12 +279,15 @@ def kfed(x_dev, dev_k, k, useSKLearn=True, sparse=False):
     assert dev_k * num_dev >= k, msg
     # Run local $k$-means
     local_clusters = []
+    local_clusters_counts = []
     for dev in x_dev:
-        cluster_centers, _ = awasthisheffet(dev, dev_k, useSKLearn=useSKLearn,
-                                            sparse=sparse)
+        cluster_centers, _, cluster_counts = awasthisheffet(dev, dev_k, useSKLearn=useSKLearn,
+                                                            sparse=sparse, round_values=round_values)
         local_clusters.append(cluster_centers)
+        local_clusters_counts.append(cluster_counts)
     # This is alwasys dense.
     local_estimates = np.concatenate(local_clusters, axis=0)
+    local_estimates_counts = np.concatenate(local_clusters_counts, axis=0)
     msg = "Not enough estimators. "
     msg += "Estimator matrix size: " + str(local_estimates.shape) + ", while "
     msg += "k = %d" % k
@@ -281,5 +295,24 @@ def kfed(x_dev, dev_k, k, useSKLearn=True, sparse=False):
     # Local estimators are dense
     centers, kmeansobj = cleaup_max(local_estimates, k, dev_k,
                                     useSKLearn=useSKLearn, sparse=False)
-    return local_estimates, centers
+    # aggregate cluster counts ('one-shot' to avoid sending the final
+    # cluster centers to each client and computing the cluster sizes
+    # in each of them and aggregating the sizes in the server) but
+    # might not be exact.
+    global_counts = []
+    for clus_id in np.unique(kmeansobj.labels_):
+        idx = np.flatnonzero(kmeansobj.labels_ == clus_id)
+        clus_count = np.sum(local_estimates_counts[idx])
+        global_counts.append(clus_count)
+    global_counts = np.array(global_counts)
+    assert global_counts.shape[0] == centers.shape[0]
 
+    # round each center to the nearest local estimate
+    if round_values:
+        rounded_centers = []
+        for i in range(centers.shape[0]):
+            dist = scipy.spatial.distance.cdist(centers[i, :].reshape(1, -1), local_estimates, metric="euclidean")
+            rounded_centers.append(local_estimates[np.argmin(dist), :])
+        centers = np.array(rounded_centers)
+
+    return local_estimates, centers, global_counts
